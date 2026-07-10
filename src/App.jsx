@@ -16,6 +16,10 @@ import {
   signOut,
   fetchCustomerProfile,
   fetchStaffProfile,
+  requestPasswordReset,
+  updatePassword,
+  updateStoreLaneCount,
+  countReservationsBeyondLane,
 } from "./lib/api";
 
 /* ============================================================
@@ -43,6 +47,24 @@ function next10Days() {
     const d = new Date(today);
     d.setDate(today.getDate() + i);
     out.push(d);
+  }
+  return out;
+}
+// 顧客の予約可能期間: 今日から見て「次の次の金曜日」まで（今日が金曜でも当日は含めない）
+function customerBookableDays() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const dow = today.getDay();
+  let daysUntilNextFriday = (5 - dow + 7) % 7;
+  if (daysUntilNextFriday === 0) daysUntilNextFriday = 7;
+  const cutoff = new Date(today);
+  cutoff.setDate(cutoff.getDate() + daysUntilNextFriday + 7);
+
+  const out = [];
+  const d = new Date(today);
+  while (d <= cutoff) {
+    out.push(new Date(d));
+    d.setDate(d.getDate() + 1);
   }
   return out;
 }
@@ -115,17 +137,21 @@ export default function App() {
   const [profileReady, setProfileReady] = useState(true);
   const [customerProfile, setCustomerProfile] = useState(null);
   const [staffProfile, setStaffProfile] = useState(null);
+  const [passwordRecovery, setPasswordRecovery] = useState(false);
+
+  const refreshStores = useCallback(() => {
+    return fetchStores()
+      .then((data) => {
+        setStores(data);
+        setStoreId((prev) => (prev && data.some((s) => s.id === prev) ? prev : data[0]?.id ?? null));
+      })
+      .catch((err) => setStoresError(errorMessage(err, "店舗情報の取得に失敗しました")));
+  }, []);
 
   // 店舗一覧を取得
   useEffect(() => {
-    fetchStores()
-      .then((data) => {
-        setStores(data);
-        if (data.length > 0) setStoreId(data[0].id);
-      })
-      .catch((err) => setStoresError(errorMessage(err, "店舗情報の取得に失敗しました")))
-      .finally(() => setStoresLoading(false));
-  }, []);
+    refreshStores().finally(() => setStoresLoading(false));
+  }, [refreshStores]);
 
   // ログイン状態の監視
   useEffect(() => {
@@ -133,8 +159,11 @@ export default function App() {
       setSession(data.session);
       setSessionReady(true);
     });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+    const { data: listener } = supabase.auth.onAuthStateChange((event, newSession) => {
       setSession(newSession);
+      if (event === "PASSWORD_RECOVERY") {
+        setPasswordRecovery(true);
+      }
     });
     return () => listener.subscription.unsubscribe();
   }, []);
@@ -165,6 +194,15 @@ export default function App() {
 
   async function logout() {
     await signOut();
+  }
+
+  if (passwordRecovery) {
+    return (
+      <div style={styles.appRoot}>
+        <style>{FONT_IMPORT}</style>
+        <PasswordRecoveryScreen onDone={() => setPasswordRecovery(false)} />
+      </div>
+    );
   }
 
   if (storesLoading) {
@@ -214,6 +252,7 @@ export default function App() {
             session={session}
             staffProfile={staffProfile}
             logout={logout}
+            refreshStores={refreshStores}
           />
         )}
       </div>
@@ -241,7 +280,7 @@ function TopBar({ stores, storeId, setStoreId, view, setView, staffLockedStore }
           <select value={storeId || ""} onChange={(e) => setStoreId(e.target.value)} style={styles.storeSelect}>
             {stores.map((s) => (
               <option key={s.id} value={s.id}>
-                {s.name}（{s.lanes}レーン）
+                {s.name}（{s.lanes}番線）
               </option>
             ))}
           </select>
@@ -276,7 +315,7 @@ function LaneOverviewMap({ store, slots, date, selectedLane, selectedStart, sele
       <div style={styles.mapHead}>
         <div style={styles.mapTitle}>
           <LayoutGrid size={14} color={AMBER} />
-          レーン空き状況マップ（全{store.lanes}レーン）
+          番線空き状況マップ（全{store.lanes}番線）
         </div>
         <div style={styles.legendRow}>
           <LegendDot color="#B33A3A" label="予約済み" />
@@ -406,6 +445,7 @@ function CustomerAuth() {
   const [authError, setAuthError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [signupDone, setSignupDone] = useState(false);
+  const [forgotMode, setForgotMode] = useState(false);
 
   async function submit() {
     setAuthError("");
@@ -452,6 +492,10 @@ function CustomerAuth() {
         </div>
       </div>
     );
+  }
+
+  if (forgotMode) {
+    return <ForgotPasswordPanel onBack={() => setForgotMode(false)} />;
   }
 
   return (
@@ -507,6 +551,14 @@ function CustomerAuth() {
           <button style={{ ...styles.primaryBtn, ...(submitting ? styles.primaryBtnDisabled : {}) }} onClick={submit} disabled={submitting}>
             {submitting ? "処理中..." : mode === "login" ? "ログイン" : "登録してはじめる"}
           </button>
+
+          {mode === "login" && (
+            <div style={styles.authHint}>
+              <button onClick={() => setForgotMode(true)} style={styles.linkBtn}>
+                パスワードをお忘れですか？
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -560,7 +612,7 @@ function MyPage({ stores }) {
           <div>
             <div style={styles.myResStore}>{st ? st.name : r.storeId}</div>
             <div style={styles.myResDetail}>
-              {formatDateJp(r.date)} ・ LANE {r.lane + 1} ・ {minToTime(r.start)}–{minToTime(r.start + r.duration)}（{r.duration}分）
+              {formatDateJp(r.date)} ・ {r.lane + 1}番線 ・ {minToTime(r.start)}–{minToTime(r.start + r.duration)}（{r.duration}分）
             </div>
           </div>
           <button style={styles.dangerBtn} onClick={() => handleCancel(r.id)}>
@@ -575,7 +627,7 @@ function MyPage({ stores }) {
 
 /* ---------------- 顧客予約フロー ---------------- */
 function CustomerBooking({ store, currentUser, goMyPage }) {
-  const days = useMemo(() => next10Days(), []);
+  const days = useMemo(() => customerBookableDays(), []);
   const [date, setDate] = useState(toDateStr(days[0]));
   const [lane, setLane] = useState(null);
   const [duration, setDuration] = useState(60);
@@ -652,8 +704,8 @@ function CustomerBooking({ store, currentUser, goMyPage }) {
             <span style={styles.ticketValue}>{formatDateJp(done.date)}</span>
           </div>
           <div style={styles.ticketRow}>
-            <span style={styles.ticketLabel}>レーン</span>
-            <span style={styles.ticketValueMono}>LANE {done.lane + 1}</span>
+            <span style={styles.ticketLabel}>番線</span>
+            <span style={styles.ticketValueMono}>{done.lane + 1}番線</span>
           </div>
           <div style={styles.ticketRow}>
             <span style={styles.ticketLabel}>時間</span>
@@ -691,6 +743,9 @@ function CustomerBooking({ store, currentUser, goMyPage }) {
             );
           })}
         </div>
+        <div style={{ ...styles.helperText, marginTop: 8 }}>
+          ご予約は{formatDateJp(toDateStr(days[days.length - 1]))}まで承っております
+        </div>
       </Section>
 
       {slotsLoading ? (
@@ -699,7 +754,7 @@ function CustomerBooking({ store, currentUser, goMyPage }) {
         <LaneOverviewMap store={store} slots={slots} date={date} selectedLane={lane} selectedStart={start} selectedDuration={duration} />
       )}
 
-      <Section num="02" title="レーンを選ぶ">
+      <Section num="02" title="番線を選ぶ">
         <div style={styles.laneGrid}>
           {laneFreeCounts.map(({ lane: li, count }) => {
             const active = li === lane;
@@ -715,7 +770,10 @@ function CustomerBooking({ store, currentUser, goMyPage }) {
                   ...(full ? styles.laneCardFull : {}),
                 }}
               >
-                <div style={styles.laneCardNum}>{li + 1}</div>
+                <div style={styles.laneCardNum}>
+                  {li + 1}
+                  <span style={styles.laneCardSuffix}>番線</span>
+                </div>
                 <div style={styles.laneCardLabel}>{full ? "満枠" : "空きあり"}</div>
               </button>
             );
@@ -739,7 +797,7 @@ function CustomerBooking({ store, currentUser, goMyPage }) {
 
       <Section num="04" title="開始時刻を選ぶ" disabled={lane === null}>
         {lane === null ? (
-          <div style={styles.helperText}>先にレーンを選択してください</div>
+          <div style={styles.helperText}>先に番線を選択してください</div>
         ) : starts.length === 0 ? (
           <div style={styles.helperText}>この条件で空いている時間がありません</div>
         ) : (
@@ -801,7 +859,7 @@ function Section({ num, title, children, disabled }) {
 }
 
 /* ---------------- スタッフエリア（ログインゲート） ---------------- */
-function StaffArea({ stores, sessionReady, profileReady, session, staffProfile, logout }) {
+function StaffArea({ stores, sessionReady, profileReady, session, staffProfile, logout, refreshStores }) {
   if (!sessionReady) {
     return <div style={styles.centerLoading}>読み込み中...</div>;
   }
@@ -832,7 +890,7 @@ function StaffArea({ stores, sessionReady, profileReady, session, staffProfile, 
     return <div style={styles.centerLoading}>担当店舗の情報が見つかりません。管理者にお問い合わせください。</div>;
   }
 
-  return <StaffDashboard store={store} staffProfile={staffProfile} logout={logout} />;
+  return <StaffDashboard store={store} staffProfile={staffProfile} logout={logout} refreshStores={refreshStores} />;
 }
 
 function StaffAuth() {
@@ -840,6 +898,7 @@ function StaffAuth() {
   const [password, setPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [forgotMode, setForgotMode] = useState(false);
 
   async function submit() {
     if (!email || !password) return;
@@ -852,6 +911,10 @@ function StaffAuth() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  if (forgotMode) {
+    return <ForgotPasswordPanel onBack={() => setForgotMode(false)} />;
   }
 
   return (
@@ -877,7 +940,156 @@ function StaffAuth() {
           <button style={{ ...styles.primaryBtn, ...(submitting ? styles.primaryBtnDisabled : {}) }} onClick={submit} disabled={submitting}>
             {submitting ? "処理中..." : "ログイン"}
           </button>
+          <div style={styles.authHint}>
+            <button onClick={() => setForgotMode(true)} style={styles.linkBtn}>
+              パスワードをお忘れですか？
+            </button>
+          </div>
           <div style={styles.authHint}>スタッフアカウントは管理者による招待制です</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- パスワード再設定 ---------------- */
+function ForgotPasswordPanel({ onBack }) {
+  const [email, setEmail] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  async function submit() {
+    if (!email) return;
+    setError("");
+    setSubmitting(true);
+    try {
+      await requestPasswordReset(email);
+      setSent(true);
+    } catch (err) {
+      setError(errorMessage(err, "送信に失敗しました"));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div style={styles.authWrap}>
+      <div style={styles.authCard}>
+        <div style={styles.authBody}>
+          {sent ? (
+            <>
+              <div style={styles.successIconWrap}>
+                <Check size={28} color="#fff" />
+              </div>
+              <h2 style={styles.successTitle}>再設定メールを送信しました</h2>
+              <div style={styles.helperText}>
+                {email} 宛にパスワード再設定用のメールを送信しました。メール内のリンクを開いて新しいパスワードを設定してください。
+              </div>
+              <button style={{ ...styles.secondaryBtn, marginTop: 12 }} onClick={onBack}>
+                ログイン画面に戻る
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={styles.formRow}>
+                <label style={styles.formLabel}>
+                  <Mail size={14} /> メールアドレス
+                </label>
+                <input style={styles.input} type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+              </div>
+              {error && <div style={styles.warnText}>{error}</div>}
+              <button
+                disabled={submitting}
+                style={{ ...styles.primaryBtn, ...(submitting ? styles.primaryBtnDisabled : {}) }}
+                onClick={submit}
+              >
+                {submitting ? "送信中..." : "再設定メールを送る"}
+              </button>
+              <button style={{ ...styles.secondaryBtn, marginTop: 8 }} onClick={onBack}>
+                ログイン画面に戻る
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PasswordRecoveryScreen({ onDone }) {
+  const [password, setPassword] = useState("");
+  const [password2, setPassword2] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [done, setDone] = useState(false);
+
+  async function submit() {
+    setError("");
+    if (password.length < 8) {
+      setError("パスワードは8文字以上で入力してください");
+      return;
+    }
+    if (password !== password2) {
+      setError("パスワードが一致しません");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await updatePassword(password);
+      setDone(true);
+    } catch (err) {
+      setError(errorMessage(err, "パスワードの変更に失敗しました"));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <div style={styles.authWrap}>
+        <div style={styles.authCard}>
+          <div style={styles.authBody}>
+            <div style={styles.successIconWrap}>
+              <Check size={28} color="#fff" />
+            </div>
+            <h2 style={styles.successTitle}>パスワードを変更しました</h2>
+            <button style={styles.primaryBtn} onClick={onDone}>
+              はじめる
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.authWrap}>
+      <div style={styles.authCard}>
+        <div style={styles.authTabGroup}>
+          <div style={{ ...styles.authTab, ...styles.authTabActive }}>新しいパスワードを設定</div>
+        </div>
+        <div style={styles.authBody}>
+          <div style={styles.formRow}>
+            <label style={styles.formLabel}>
+              <Lock size={14} /> 新しいパスワード
+            </label>
+            <input style={styles.input} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="8文字以上" />
+          </div>
+          <div style={styles.formRow}>
+            <label style={styles.formLabel}>
+              <Lock size={14} /> 新しいパスワード（確認）
+            </label>
+            <input style={styles.input} type="password" value={password2} onChange={(e) => setPassword2(e.target.value)} placeholder="もう一度入力" />
+          </div>
+          {error && <div style={styles.warnText}>{error}</div>}
+          <button
+            disabled={submitting}
+            style={{ ...styles.primaryBtn, ...(submitting ? styles.primaryBtnDisabled : {}) }}
+            onClick={submit}
+          >
+            {submitting ? "変更中..." : "パスワードを変更する"}
+          </button>
         </div>
       </div>
     </div>
@@ -887,10 +1099,11 @@ function StaffAuth() {
 /* ---------------- スタッフ管理画面 ---------------- */
 const ROW_H = 16;
 
-function StaffDashboard({ store, staffProfile, logout }) {
+function StaffDashboard({ store, staffProfile, logout, refreshStores }) {
   const days = useMemo(() => next10Days(), []);
   const [date, setDate] = useState(toDateStr(days[0]));
   const [modal, setModal] = useState(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
@@ -962,6 +1175,9 @@ function StaffDashboard({ store, staffProfile, logout }) {
             <LegendDot color="#8A6D2F" label="店頭登録" />
           </div>
           <div style={styles.staffWho}>{staffProfile.name} さん</div>
+          <button onClick={() => setSettingsOpen(true)} style={styles.userBarTab}>
+            店舗設定
+          </button>
           <button onClick={logout} style={styles.userBarLogout}>
             ログアウト
           </button>
@@ -1013,6 +1229,17 @@ function StaffDashboard({ store, staffProfile, logout }) {
           date={date}
         />
       )}
+
+      {settingsOpen && (
+        <StoreSettingsModal
+          store={store}
+          onClose={() => setSettingsOpen(false)}
+          onSaved={() => {
+            setSettingsOpen(false);
+            refreshStores();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1032,7 +1259,7 @@ function LaneColumn({ store, laneIdx, reservations, onEmptyClick, onResClick }) 
     <div style={styles.laneCol}>
       <div style={styles.laneColHeader}>
         <div style={styles.laneColHeaderNum}>{laneIdx + 1}</div>
-        <div style={styles.laneColHeaderText}>LANE</div>
+        <div style={styles.laneColHeaderText}>番線</div>
       </div>
       <div style={{ ...styles.laneColTrack, height: totalH }}>
         {Array.from({ length: slotCount(store) }, (_, i) => {
@@ -1102,7 +1329,7 @@ function ReservationModal({ modal, store, reservations, onClose, onSave, onDelet
           <div>
             <div style={styles.modalTitle}>{modal.mode === "new" ? "予約を登録" : "予約を編集"}</div>
             <div style={styles.modalSub}>
-              LANE {modal.lane + 1} ・ {formatDateJp(date)}
+              {modal.lane + 1}番線 ・ {formatDateJp(date)}
             </div>
           </div>
           <button onClick={onClose} style={styles.iconBtn}>
@@ -1162,6 +1389,79 @@ function ReservationModal({ modal, store, reservations, onClose, onSave, onDelet
             disabled={!name || !phone || !free || saving}
             onClick={handleSave}
             style={{ ...styles.primaryBtn, ...((!name || !phone || !free || saving) ? styles.primaryBtnDisabled : {}) }}
+          >
+            {saving ? "保存中..." : "保存する"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StoreSettingsModal({ store, onClose, onSaved }) {
+  const [laneCount, setLaneCount] = useState(store.lanes);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleSave() {
+    setError("");
+    if (!Number.isInteger(laneCount) || laneCount < 1) {
+      setError("番線数は1以上の整数で入力してください");
+      return;
+    }
+    setSaving(true);
+    try {
+      if (laneCount < store.lanes) {
+        const overflow = await countReservationsBeyondLane(store.id, laneCount);
+        if (overflow > 0) {
+          setError(
+            `${laneCount + 1}番線以降に今日以降の予約が${overflow}件あるため、この番線数には変更できません。先にそれらの予約を移動・キャンセルしてください。`
+          );
+          setSaving(false);
+          return;
+        }
+      }
+      await updateStoreLaneCount(store.id, laneCount);
+      onSaved();
+    } catch (err) {
+      setError("保存に失敗しました。管理者にお問い合わせください。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={styles.modalCard} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHead}>
+          <div>
+            <div style={styles.modalTitle}>店舗設定</div>
+            <div style={styles.modalSub}>{store.name}</div>
+          </div>
+          <button onClick={onClose} style={styles.iconBtn}>
+            <X size={18} />
+          </button>
+        </div>
+
+        <div style={styles.modalBody}>
+          <div style={styles.formRow}>
+            <label style={styles.formLabel}>番線数</label>
+            <input
+              type="number"
+              min={1}
+              style={styles.input}
+              value={laneCount}
+              onChange={(e) => setLaneCount(parseInt(e.target.value, 10) || 0)}
+            />
+          </div>
+          {error && <div style={styles.warnText}>{error}</div>}
+        </div>
+
+        <div style={styles.modalFoot}>
+          <button
+            disabled={saving}
+            onClick={handleSave}
+            style={{ ...styles.primaryBtn, ...(saving ? styles.primaryBtnDisabled : {}) }}
           >
             {saving ? "保存中..." : "保存する"}
           </button>
@@ -1245,6 +1545,10 @@ const styles = {
   authTabActive: { color: NAVY_950, boxShadow: `inset 0 -2px 0 ${AMBER}` },
   authBody: { padding: "20px 22px" },
   authHint: { marginTop: 12, fontSize: 11.5, color: INK_SOFT, textAlign: "center" },
+  linkBtn: {
+    border: "none", background: "transparent", color: NAVY_950, fontSize: 12,
+    textDecoration: "underline", cursor: "pointer", padding: 0, fontFamily: "'Inter', sans-serif",
+  },
 
   userBar: {
     display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10,
@@ -1308,6 +1612,7 @@ const styles = {
   laneCardActive: { background: "#EFDDB8", borderColor: AMBER },
   laneCardFull: { opacity: 0.35, cursor: "not-allowed" },
   laneCardNum: { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 16 },
+  laneCardSuffix: { fontSize: 11, fontWeight: 600, marginLeft: 2 },
   laneCardLabel: { fontSize: 9.5, color: INK_SOFT, marginTop: 2 },
 
   durationRow: { display: "flex", gap: 8, flexWrap: "wrap" },
