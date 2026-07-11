@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useEffect, useCallback } from "react";
-import { Calendar, User, Phone, Mail, Lock, Check, X, Plus, Clock, ChevronLeft, ChevronRight, LayoutGrid, Train } from "lucide-react";
+import { Calendar, User, Phone, Mail, Lock, Check, X, Plus, Clock, ChevronLeft, ChevronRight, LayoutGrid } from "lucide-react";
+import logoImg from "./assets/logo.png";
 import { supabase } from "./lib/supabaseClient";
 import {
   fetchStores,
@@ -18,8 +19,8 @@ import {
   fetchStaffProfile,
   requestPasswordReset,
   updatePassword,
-  updateStoreLaneCount,
-  countReservationsBeyondLane,
+  updateStoreSettings,
+  countReservationsViolatingSettings,
 } from "./lib/api";
 
 /* ============================================================
@@ -266,7 +267,7 @@ function TopBar({ stores, storeId, setStoreId, view, setView, staffLockedStore }
     <div style={styles.topbar}>
       <div style={styles.topbarLeft}>
         <div style={styles.brandMark}>
-          <Train size={18} color="#E8A33D" strokeWidth={2.2} />
+          <img src={logoImg} alt="ポポンデッタ" style={styles.brandMarkImg} />
         </div>
         <div>
           <div style={styles.brandTitle}>レンタルレイアウト予約</div>
@@ -1398,8 +1399,15 @@ function ReservationModal({ modal, store, reservations, onClose, onSave, onDelet
   );
 }
 
+function timeToMin(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + m;
+}
+
 function StoreSettingsModal({ store, onClose, onSaved }) {
   const [laneCount, setLaneCount] = useState(store.lanes);
+  const [openTime, setOpenTime] = useState(minToTime(store.openMin));
+  const [closeTime, setCloseTime] = useState(minToTime(store.closeMin));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -1409,19 +1417,30 @@ function StoreSettingsModal({ store, onClose, onSaved }) {
       setError("番線数は1以上の整数で入力してください");
       return;
     }
+    const openMin = timeToMin(openTime);
+    const closeMin = timeToMin(closeTime);
+    if (openMin % 10 !== 0 || closeMin % 10 !== 0) {
+      setError("営業時間は10分単位で入力してください");
+      return;
+    }
+    if (openMin >= closeMin) {
+      setError("閉店時刻は開店時刻より後にしてください");
+      return;
+    }
     setSaving(true);
     try {
-      if (laneCount < store.lanes) {
-        const overflow = await countReservationsBeyondLane(store.id, laneCount);
-        if (overflow > 0) {
+      const changed = laneCount < store.lanes || openMin > store.openMin || closeMin < store.closeMin;
+      if (changed) {
+        const violating = await countReservationsViolatingSettings(store.id, { laneCount, openMin, closeMin });
+        if (violating > 0) {
           setError(
-            `${laneCount + 1}番線以降に今日以降の予約が${overflow}件あるため、この番線数には変更できません。先にそれらの予約を移動・キャンセルしてください。`
+            `変更後の設定に収まらない、今日以降の予約が${violating}件あるため変更できません。先にそれらの予約を移動・キャンセルしてください。`
           );
           setSaving(false);
           return;
         }
       }
-      await updateStoreLaneCount(store.id, laneCount);
+      await updateStoreSettings(store.id, { laneCount, openMin, closeMin });
       onSaved();
     } catch (err) {
       setError("保存に失敗しました。管理者にお問い合わせください。");
@@ -1453,6 +1472,18 @@ function StoreSettingsModal({ store, onClose, onSaved }) {
               value={laneCount}
               onChange={(e) => setLaneCount(parseInt(e.target.value, 10) || 0)}
             />
+          </div>
+          <div style={styles.formRow}>
+            <label style={styles.formLabel}>
+              <Clock size={14} /> 開店時刻
+            </label>
+            <input type="time" step={600} style={styles.input} value={openTime} onChange={(e) => setOpenTime(e.target.value)} />
+          </div>
+          <div style={styles.formRow}>
+            <label style={styles.formLabel}>
+              <Clock size={14} /> 閉店時刻
+            </label>
+            <input type="time" step={600} style={styles.input} value={closeTime} onChange={(e) => setCloseTime(e.target.value)} />
           </div>
           {error && <div style={styles.warnText}>{error}</div>}
         </div>
@@ -1510,10 +1541,11 @@ const styles = {
   },
   topbarLeft: { display: "flex", alignItems: "center", gap: 10 },
   brandMark: {
-    width: 34, height: 34, borderRadius: 8, background: NAVY_800,
+    width: 34, height: 34, borderRadius: 8, overflow: "hidden",
     display: "flex", alignItems: "center", justifyContent: "center",
-    border: `1px solid rgba(232,163,61,0.4)`,
+    border: `1px solid rgba(232,163,61,0.4)`, flexShrink: 0,
   },
+  brandMarkImg: { width: "100%", height: "100%", objectFit: "cover", display: "block" },
   brandTitle: { color: "#fff", fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 15, letterSpacing: 0.2 },
   brandSub: { color: "#8B93A8", fontFamily: "'IBM Plex Mono', monospace", fontSize: 9.5, letterSpacing: 1.2, marginTop: 2 },
   topbarRight: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" },

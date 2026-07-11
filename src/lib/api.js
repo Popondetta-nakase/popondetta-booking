@@ -203,30 +203,31 @@ export async function updatePassword(newPassword) {
 }
 
 /* ============================================================
-   店舗設定（スタッフによる番線数の変更）
+   店舗設定（スタッフによる番線数・営業時間の変更）
    ============================================================ */
-export async function updateStoreLaneCount(storeId, laneCount) {
+export async function updateStoreSettings(storeId, { laneCount, openMin, closeMin }) {
   // RLSの権限が無い場合、Supabaseは0件更新でもエラーを返さないため
   // .select().single() で「実際に1件更新されたか」を確認する
   const { error } = await supabase
     .from("stores")
-    .update({ lane_count: laneCount })
+    .update({ lane_count: laneCount, open_min: openMin, close_min: closeMin })
     .eq("id", storeId)
     .select()
     .single();
   if (error) throw error;
 }
 
-export async function countReservationsBeyondLane(storeId, laneCount) {
+export async function countReservationsViolatingSettings(storeId, { laneCount, openMin, closeMin }) {
   const today = new Date();
   const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
-  const { count, error } = await supabase
+  const { data, error } = await supabase
     .from("reservations")
-    .select("id", { count: "exact", head: true })
+    .select("lane_number, start_min, duration_min")
     .eq("store_id", storeId)
     .eq("status", "confirmed")
-    .gte("lane_number", laneCount)
     .gte("date", todayStr);
   if (error) throw error;
-  return count || 0;
+  return data.filter(
+    (r) => r.lane_number >= laneCount || r.start_min < openMin || r.start_min + r.duration_min > closeMin
+  ).length;
 }
